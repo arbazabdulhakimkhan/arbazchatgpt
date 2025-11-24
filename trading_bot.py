@@ -658,16 +658,29 @@ def generate_daily_summary():
         send_telegram_fut(f"❌ summary error: {e}")
 
 def summary_scheduler():
-    last_sent_date = None
+    """Send summary every 3 hours"""
+    last_sent_time = None
+    INTERVAL_HOURS = 3  # Send every 3 hours
+    
     while True:
         try:
             now = ist_now()
-            if now.hour == SUMMARY_HOUR_IST and (last_sent_date is None or last_sent_date != now.date()):
+            
+            # If first run or 3 hours passed since last summary
+            if last_sent_time is None:
                 generate_daily_summary()
-                last_sent_date = now.date()
-            time.sleep(60)
-        except Exception:
-            time.sleep(60)
+                last_sent_time = now
+            else:
+                hours_since_last = (now - last_sent_time).total_seconds() / 3600
+                if hours_since_last >= INTERVAL_HOURS:
+                    generate_daily_summary()
+                    last_sent_time = now
+            
+            time.sleep(300)  # Check every 5 minutes (not every minute)
+        except Exception as e:
+            print(f"Summary scheduler error: {e}")
+            time.sleep(300)
+
 
 # =========================
 # MAIN
@@ -704,3 +717,4 @@ Max Position: {MAX_POSITION_PCT*100:.0f}% of capital
 
 if __name__ == "__main__":
     main()
+
