@@ -351,9 +351,8 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
 
     trade_row = None
 
-    # ===== EXIT LOGIC =====
+        # ===== EXIT LOGIC =====
     if state["position"] != 0:
-        # ✅ FIX #1: Check minimum hold period
         bars_held = i - state.get("entry_bar_index", 0)
         
         exit_flag = False; exit_reason = ""; exit_price = price
@@ -364,7 +363,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             elif price <= state["entry_sl"]:
                 exit_flag, exit_price, exit_reason = True, state["entry_sl"], "Stop Loss"
                 state["bearish_count"] = 0
-            elif bars_held >= 3:  # ✅ Only check 4H/Bias after 3 bars
+            elif bars_held >= 3:
                 if USE_H1_FILTER and (h4t < 0 and bias < 0):
                     exit_flag, exit_price, exit_reason = True, price, "4H Trend Reversal"
                 elif bias < 0:
@@ -372,7 +371,6 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                     if state["bearish_count"] >= BIAS_CONFIRM_BEAR:
                         exit_flag, exit_price, exit_reason = True, price, "Bias Reversal"
                         state["bearish_count"] = 0
-                # ✅ FIX #2: Don't reset on neutral bias
                 elif bias > 0:
                     state["bearish_count"] = 0
             else:
@@ -384,7 +382,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             elif price >= state["entry_sl"]:
                 exit_flag, exit_price, exit_reason = True, state["entry_sl"], "Stop Loss"
                 state["bearish_count"] = 0
-            elif bars_held >= 3:  # ✅ Only check 4H/Bias after 3 bars
+            elif bars_held >= 3:
                 if USE_H1_FILTER and (h4t > 0 and bias > 0):
                     exit_flag, exit_price, exit_reason = True, price, "4H Trend Reversal"
                 elif bias > 0:
@@ -392,7 +390,6 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                     if state["bearish_count"] >= BIAS_CONFIRM_BEAR:
                         exit_flag, exit_price, exit_reason = True, price, "Bias Reversal"
                         state["bearish_count"] = 0
-                # ✅ FIX #2: Don't reset on neutral bias
                 elif bias < 0:
                     state["bearish_count"] = 0
             else:
@@ -409,7 +406,6 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
 
             gross = state["entry_size"] * (exit_price - state["entry_price"]) * (1 if state["position"]==1 else -1)
             pos_val = abs(exit_price * state["entry_size"])
-            # ✅ FIX #5: Removed slippage deduction
             pnl = gross - pos_val*FEE_RATE
             state["capital"] += pnl
 
@@ -427,9 +423,17 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
 
             emoji = "💚" if pnl>0 else "❤️"
             send_telegram_fut(f"{emoji} EXIT {symbol} {exit_reason} @ {exit_price:.4f} | PnL ${pnl:.2f}")
+            
+            # ✅ ✅ ✅ CRITICAL FIX: RETURN IMMEDIATELY AFTER EXIT! ✅ ✅ ✅
+            state["last_processed_ts"] = ts
+            state["peak_equity"] = max(state["peak_equity"], state["capital"])
+            return state, trade_row  # ← THIS LINE PREVENTS SAME-BAR RE-ENTRY!
 
     # ===== ENTRY LOGIC =====
+    # This section will ONLY run if we didn't exit above!
     if state["position"] == 0:
+        # ... rest of entry logic ...
+
         # ✅ FIX #10: Improved cooldown handling
         if COOLDOWN_HOURS>0 and state.get("last_exit_time") is not None:
             last_exit = state["last_exit_time"]
@@ -717,4 +721,3 @@ Max Position: {MAX_POSITION_PCT*100:.0f}% of capital
 
 if __name__ == "__main__":
     main()
-
