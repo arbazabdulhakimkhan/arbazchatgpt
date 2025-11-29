@@ -1,4 +1,4 @@
-# trading_bot.py - CORRECTED VERSION with 15 bug fixes
+# trading_bot.py - CORRECTED VERSION with 15 bug fixes + AUTO ROTATION (Aggressive)
 import os, time, json, traceback, threading
 from datetime import datetime, timedelta, timezone
 import ccxt
@@ -11,6 +11,7 @@ import requests
 # =========================
 MODE = os.getenv("MODE", "paper").lower()
 EXCHANGE_ID = "kucoinfutures"
+# Env symbols now treated as fallback / seed, not final
 SYMBOLS = [s.strip() for s in os.getenv(
     "SYMBOLS",
     "ARB/USDT:USDT,LINK/USDT:USDT,SOL/USDT:USDT,ETH/USDT:USDT,BTC/USDT:USDT"
@@ -41,7 +42,7 @@ VOL_MIN_RATIO = float(os.getenv("VOL_MIN_RATIO", "0.5"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "25"))
 RSI_OVERBOUGHT = 100 - RSI_OVERSOLD
-BIAS_CONFIRM_BEAR = int(os.getenv("BIAS_CONFIRM_BEAR", "8"))  # ✅ FIX #12: Changed default from 2 to 8
+BIAS_CONFIRM_BEAR = int(os.getenv("BIAS_CONFIRM_BEAR", "8"))  # ✅ FIX #12
 COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "0.0"))
 
 MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.20"))
@@ -49,7 +50,7 @@ MAX_TRADE_SIZE = float(os.getenv("MAX_TRADE_SIZE", "100000"))
 SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0005"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0006"))
 INCLUDE_FUNDING = os.getenv("INCLUDE_FUNDING", "true").lower() == "true"
-MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.5"))  # ✅ FIX #9: New parameter
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.5"))  # ✅ FIX #9
 
 TELEGRAM_TOKEN_FUT = os.getenv("TELEGRAM_TOKEN_FUT", "")
 TELEGRAM_CHAT_ID_FUT = os.getenv("TELEGRAM_CHAT_ID_FUT", "")
@@ -63,6 +64,13 @@ SUMMARY_HOUR_IST = int(os.getenv("SUMMARY_HOUR", "20"))
 
 SLEEP_CAP = int(os.getenv("SLEEP_CAP", "60"))
 LOG_PREFIX = "[FUT-BOT]"
+
+# rotation config
+ROTATION_INTERVAL_HOURS = float(os.getenv("ROTATION_INTERVAL_HOURS", "6"))
+
+# dynamic active symbols + lock
+ACTIVE_SYMBOLS = []
+SYMBOLS_LOCK = threading.Lock()
 
 if MODE == "live":
     if not API_KEY or not API_SECRET or not API_PASSPHRASE:
@@ -178,6 +186,44 @@ def align_funding_to_index(idx, funding_df):
     return s
 
 # =========================
+# TOP GAINERS (for rotation)
+# =========================
+def get_top_gainers(exchange, limit=5):
+    """
+    Return top `limit` symbols (*/USDT:USDT) by daily percentage change.
+    Fallback to env SYMBOLS on failure.
+    """
+    try:
+        tickers = exchange.fetch_tickers()
+    except Exception as e:
+        send_telegram_fut(f"{LOG_PREFIX} get_top_gainers error: {e}")
+        return SYMBOLS[:limit]
+
+    rows = []
+    for sym, data in tickers.items():
+        # KuCoin futures perps like 'COIN/USDT:USDT'
+        if not sym.endswith(":USDT"):
+            continue
+        pct = data.get("percentage", None)
+        if pct is None:
+            last = data.get("last")
+            open_ = data.get("open")
+            try:
+                if last is not None and open_ not in (None, 0):
+                    pct = (last - open_) / open_ * 100.0
+            except Exception:
+                pct = None
+        if pct is None:
+            continue
+        rows.append((sym, float(pct)))
+
+    if not rows:
+        return SYMBOLS[:limit]
+
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return [s for s,_ in rows[:limit]]
+
+# =========================
 # INDICATORS
 # =========================
 def calculate_rsi(prices, period=14):
@@ -199,7 +245,7 @@ def position_size_futures(price, sl, capital, risk_percent, max_trade_size, max_
     risk_per_trade = capital * risk_percent
     rpc = abs(price - sl)
     max_by_risk = (risk_per_trade / rpc) if rpc > 0 else 0
-    max_by_capital = (capital / price) * max_position_pct  # ✅ Cap at 50%
+    max_by_capital = (capital / price) * max_position_pct
     return max(min(max_by_risk, max_by_capital, max_trade_size / price), 0)
 
 # =========================
@@ -229,7 +275,7 @@ def load_state(state_file):
         "entry_tp": 0.0,
         "entry_time": None,
         "entry_size": 0.0,
-        "entry_bar_index": 0,  # ✅ FIX #1: Added for minimum hold
+        "entry_bar_index": 0,  # ✅ FIX #1
         "peak_equity": PER_COIN_CAP_USD,
         "last_processed_ts": None,
         "last_exit_time": None,
@@ -267,7 +313,10 @@ def avg_fill_price(order):
     return None
 
 def amount_to_precision(exchange, symbol, amt):
-    return float(exchange.amount_to_precision(symbol, amt))
+    try:
+        return float(exchange.amount_to_precision(symbol, amt))
+    except Exception:
+        return float(amt)
 
 # ✅ FIX #13: Added leverage verification
 def verify_leverage(exchange, symbol):
@@ -333,7 +382,6 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                 send_telegram_fut(f"❌ {symbol} forced-exit failed: {e}")
         gross = state["entry_size"] * (exit_price - state["entry_price"]) * (1 if state["position"]==1 else -1)
         pos_val = abs(exit_price * state["entry_size"])
-        # ✅ FIX #5: Removed slippage deduction
         pnl = gross - pos_val*FEE_RATE
         state["capital"] += pnl
         row = {
@@ -345,14 +393,16 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
             "PnL_$": round(pnl,2), "Win": 1 if pnl>0 else 0,
             "Exit_Reason": "MAX DRAWDOWN", "Capital_After": round(state["capital"],2), "Mode": MODE
         }
-        state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0,"bearish_count":0,"entry_bar_index":0})
+        state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,
+                      "entry_time":None,"entry_size":0.0,"bearish_count":0,"entry_bar_index":0})
         state["last_exit_time"] = ts
         return state, row
 
     trade_row = None
 
-        # ===== EXIT LOGIC =====
+    # ===== EXIT LOGIC =====
     if state["position"] != 0:
+        # ✅ FIX #1: Check minimum hold period
         bars_held = i - state.get("entry_bar_index", 0)
         
         exit_flag = False; exit_reason = ""; exit_price = price
@@ -418,22 +468,21 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                 "PnL_$": round(pnl,2), "Win": 1 if pnl>0 else 0,
                 "Exit_Reason": exit_reason, "Capital_After": round(state["capital"],2), "Mode": MODE
             }
-            state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,"entry_time":None,"entry_size":0.0,"entry_bar_index":0})
+            state.update({"position":0,"entry_price":0.0,"entry_sl":0.0,"entry_tp":0.0,
+                          "entry_time":None,"entry_size":0.0,"entry_bar_index":0})
             state["last_exit_time"] = ts
 
             emoji = "💚" if pnl>0 else "❤️"
             send_telegram_fut(f"{emoji} EXIT {symbol} {exit_reason} @ {exit_price:.4f} | PnL ${pnl:.2f}")
             
-            # ✅ ✅ ✅ CRITICAL FIX: RETURN IMMEDIATELY AFTER EXIT! ✅ ✅ ✅
+            # CRITICAL FIX: return immediately after exit (no same-bar re-entry)
             state["last_processed_ts"] = ts
             state["peak_equity"] = max(state["peak_equity"], state["capital"])
-            return state, trade_row  # ← THIS LINE PREVENTS SAME-BAR RE-ENTRY!
+            return state, trade_row
 
     # ===== ENTRY LOGIC =====
     # This section will ONLY run if we didn't exit above!
     if state["position"] == 0:
-        # ... rest of entry logic ...
-
         # ✅ FIX #10: Improved cooldown handling
         if COOLDOWN_HOURS>0 and state.get("last_exit_time") is not None:
             last_exit = state["last_exit_time"]
@@ -475,33 +524,30 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                 # ✅ FIX #3: Swapped MIN_RR and MAX_RR logic
                 if DYNAMIC_RR and USE_ATR_STOPS and i >= 6:
                     recent = float(h1['ATR'].iloc[i-5:i].mean())
-                    curr = float(h1['ATR'].iloc[i])
+                    curr_atr = float(h1['ATR'].iloc[i])
                     if recent > 0:
-                        if curr > recent*1.2: rr = MAX_RR  # ✅ High vol = bigger target
-                        elif curr < recent*0.8: rr = MIN_RR  # ✅ Low vol = smaller target
+                        if curr_atr > recent*1.2: rr = MAX_RR
+                        elif curr_atr < recent*0.8: rr = MIN_RR
                 tp = price + rr * risk
             else:
                 sl = price + (ATR_MULT_SL * h1['ATR'].iloc[i]) if USE_ATR_STOPS else price * (1 + min(max(price*0.0005,0.0005),0.0015))
                 risk = abs(sl - price)
                 rr = RR_FIXED
-                # ✅ FIX #3: Swapped MIN_RR and MAX_RR logic
                 if DYNAMIC_RR and USE_ATR_STOPS and i >= 6:
                     recent = float(h1['ATR'].iloc[i-5:i].mean())
-                    curr = float(h1['ATR'].iloc[i])
+                    curr_atr = float(h1['ATR'].iloc[i])
                     if recent > 0:
-                        if curr > recent*1.2: rr = MAX_RR  # ✅ High vol = bigger target
-                        elif curr < recent*0.8: rr = MIN_RR  # ✅ Low vol = smaller target
+                        if curr_atr > recent*1.2: rr = MAX_RR
+                        elif curr_atr < recent*0.8: rr = MIN_RR
                 tp = price - rr * risk
 
             if risk > 0:
-                # ✅ FIX #9: Added MAX_POSITION_PCT parameter
                 size = position_size_futures(price, sl, state["capital"], RISK_PERCENT, MAX_TRADE_SIZE, MAX_POSITION_PCT)
                 if size > 0:
                     entry_price_used = price
                     side = "buy" if signal==1 else "sell"
                     if MODE == "live":
                         try:
-                            # ✅ FIX #11: Round before storing
                             size = amount_to_precision(exchange, symbol, size)
                             order = place_market(exchange, symbol, side, size, reduce_only=False)
                             ep = avg_fill_price(order)
@@ -518,11 +564,10 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
                     state["entry_time"] = ts
                     state["entry_size"] = size
                     state["bearish_count"] = 0
-                    state["entry_bar_index"] = i  # ✅ FIX #1: Track entry bar
+                    state["entry_bar_index"] = i  # ✅ FIX #1
 
                     pos_val = abs(entry_price_used * size)
-                    # ✅ FIX #4: Removed slippage deduction (already in live fill)
-                    state["capital"] -= pos_val*FEE_RATE
+                    state["capital"] -= pos_val*FEE_RATE  # ✅ FIX #4
 
                     tag = "LONG" if signal==1 else "SHORT"
                     send_telegram_fut(f"🚀 ENTRY {symbol} {tag} @ {entry_price_used:.4f} | SL {sl:.4f} | TP {tp:.4f} | RR {rr:.1f}")
@@ -535,6 +580,7 @@ def process_bar(symbol, h1, h4, state, exchange=None, funding_series=None):
 # WORKER THREAD
 # =========================
 def worker(symbol):
+    global ACTIVE_SYMBOLS
     state_file, trades_csv = state_files_for_symbol(symbol)
     exchange = get_exchange()
     state = load_state(state_file)
@@ -545,6 +591,12 @@ def worker(symbol):
     send_telegram_fut(f"🤖 {symbol} FUTURES bot started | {ENTRY_TF}/{HTF} | cap ${state['capital']:.2f}")
 
     while True:
+        # stop worker if symbol removed from rotation
+        with SYMBOLS_LOCK:
+            if symbol not in ACTIVE_SYMBOLS:
+                send_telegram_fut(f"🛑 Stopping worker for {symbol} (removed from active list)")
+                break
+
         try:
             now = datetime.now(timezone.utc)
             since = now - timedelta(days=LOOKBACK_DAYS)
@@ -595,6 +647,128 @@ def worker(symbol):
             time.sleep(60)
 
 # =========================
+# ROTATION MANAGER (AGGRESSIVE)
+# =========================
+def rotation_manager():
+    """
+    Every ROTATION_INTERVAL_HOURS:
+    - recompute top N gainers (N = len(ACTIVE_SYMBOLS) or 5)
+    - aggressively rotate: old coin out -> forced exit, capital moved to new coin
+    """
+    global ACTIVE_SYMBOLS
+    exchange = get_exchange()
+
+    while True:
+        time.sleep(int(ROTATION_INTERVAL_HOURS * 3600))
+        try:
+            with SYMBOLS_LOCK:
+                current = list(ACTIVE_SYMBOLS)
+            if not current:
+                continue
+
+            new_top = get_top_gainers(exchange, limit=len(current))
+            if not new_top:
+                continue
+
+            to_remove = [s for s in current if s not in new_top]
+            to_add = [s for s in new_top if s not in current]
+
+            # pair old->new
+            for old_sym, new_sym in zip(to_remove, to_add):
+                try:
+                    # load old state
+                    old_state_file, old_trades_csv = state_files_for_symbol(old_sym)
+                    old_state = load_state(old_state_file)
+
+                    # forced exit if open
+                    if old_state.get("position", 0) != 0:
+                        size = float(old_state.get("entry_size", 0.0))
+                        entry_price = float(old_state.get("entry_price", 0.0) or 0.0)
+                        exit_price = entry_price
+                        side = "sell" if old_state["position"] == 1 else "buy"
+
+                        try:
+                            ticker = exchange.fetch_ticker(old_sym)
+                            last_px = ticker.get("last") or ticker.get("close")
+                            if last_px is not None:
+                                exit_price = float(last_px)
+                        except Exception:
+                            pass
+
+                        if MODE == "live" and size > 0:
+                            try:
+                                order = place_market(exchange, old_sym, side, amount_to_precision(exchange, old_sym, size), reduce_only=True)
+                                px = avg_fill_price(order)
+                                if px is not None:
+                                    exit_price = float(px)
+                            except Exception as e:
+                                send_telegram_fut(f"❌ rotation exit failed {old_sym}: {e}")
+
+                        if size > 0 and entry_price > 0:
+                            gross = size * (exit_price - entry_price) * (1 if old_state["position"]==1 else -1)
+                            pos_val = abs(exit_price * size)
+                            pnl = gross - pos_val*FEE_RATE
+                            old_state["capital"] += pnl
+
+                            row = {
+                                "Symbol": old_sym,
+                                "Entry_DateTime": old_state.get("entry_time"),
+                                "Exit_DateTime": datetime.now(timezone.utc).replace(tzinfo=None),
+                                "Position": "Long" if old_state["position"]==1 else "Short",
+                                "Entry_Price": round(entry_price,6),
+                                "Exit_Price": round(exit_price,6),
+                                "Take_Profit": round(float(old_state.get("entry_tp",0.0)),6),
+                                "Stop_Loss": round(float(old_state.get("entry_sl",0.0)),6),
+                                "Position_Size_Base": round(size,8),
+                                "PnL_$": round(pnl,2),
+                                "Win": 1 if pnl>0 else 0,
+                                "Exit_Reason": "ROTATION_EXIT",
+                                "Capital_After": round(old_state["capital"],2),
+                                "Mode": MODE
+                            }
+                            append_trade(old_trades_csv, row)
+
+                        # clear position
+                        old_state["position"] = 0
+                        old_state["entry_price"] = 0.0
+                        old_state["entry_sl"] = 0.0
+                        old_state["entry_tp"] = 0.0
+                        old_state["entry_time"] = None
+                        old_state["entry_size"] = 0.0
+                        old_state["bearish_count"] = 0
+                        old_state["entry_bar_index"] = 0
+
+                    capital_to_transfer = float(old_state.get("capital", PER_COIN_CAP_USD))
+                    save_state(old_state_file, old_state)
+
+                    # update ACTIVE_SYMBOLS
+                    with SYMBOLS_LOCK:
+                        if old_sym in ACTIVE_SYMBOLS:
+                            ACTIVE_SYMBOLS.remove(old_sym)
+                        if new_sym not in ACTIVE_SYMBOLS:
+                            ACTIVE_SYMBOLS.append(new_sym)
+
+                    # init new symbol state with transferred capital
+                    new_state_file, _ = state_files_for_symbol(new_sym)
+                    new_state = load_state(new_state_file)
+                    new_state["capital"] = capital_to_transfer
+                    save_state(new_state_file, new_state)
+
+                    # start worker for new symbol
+                    t = threading.Thread(target=worker, args=(new_sym,), daemon=True)
+                    t.start()
+
+                    send_telegram_fut(f"🔁 ROTATE: {old_sym} → {new_sym} | capital ${capital_to_transfer:.2f}")
+
+                except Exception as e:
+                    send_telegram_fut(f"{LOG_PREFIX} rotation error {old_sym}->{new_sym}: {e}")
+                    continue
+
+        except Exception as e:
+            send_telegram_fut(f"{LOG_PREFIX} rotation manager error: {e}")
+            continue
+
+# =========================
 # DAILY SUMMARY
 # =========================
 def ist_now():
@@ -611,7 +785,11 @@ def generate_daily_summary():
         lines = [f"📊 FUTURES DAILY SUMMARY — {now_ist.strftime('%Y-%m-%d %I:%M %p IST')}", "-"*60]
         total_cap, total_init, pnl_today, n_today, w_today = 0.0, 0.0, 0.0, 0, 0
 
-        for sym in SYMBOLS:
+        # use ACTIVE_SYMBOLS if available, else fallback to env SYMBOLS
+        with SYMBOLS_LOCK:
+            symbols_for_summary = list(ACTIVE_SYMBOLS) if ACTIVE_SYMBOLS else list(SYMBOLS)
+
+        for sym in symbols_for_summary:
             state_file, trades_csv = state_files_for_symbol(sym)
             state = load_state(state_file) if os.path.exists(state_file) else {"capital": PER_COIN_CAP_USD, "position":0}
             cap = float(state.get("capital", PER_COIN_CAP_USD))
@@ -680,37 +858,62 @@ def summary_scheduler():
                     generate_daily_summary()
                     last_sent_time = now
             
-            time.sleep(300)  # Check every 5 minutes (not every minute)
+            time.sleep(300)  # Check every 5 minutes
         except Exception as e:
             print(f"Summary scheduler error: {e}")
             time.sleep(300)
-
 
 # =========================
 # MAIN
 # =========================
 def main():
+    global ACTIVE_SYMBOLS
+
     boot = f"""
-🚀 Futures Bot Started (FIXED VERSION)
+🚀 Futures Bot Started (FIXED VERSION + AUTO ROTATION)
 Mode: {MODE.upper()}
 Exchange: KuCoin Futures (perps)
-Symbols: {", ".join(SYMBOLS)}
+Env Symbols (fallback): {", ".join(SYMBOLS)}
 TF: {ENTRY_TF}/{HTF}
 Cap/coin: ${PER_COIN_CAP_USD:,.2f}
 Risk: {RISK_PERCENT*100:.1f}% | Fee: {FEE_RATE*100:.3f}%
 Funding: {"ON" if INCLUDE_FUNDING else "OFF"}
 Bias Confirm: {BIAS_CONFIRM_BEAR} bars
 Max Position: {MAX_POSITION_PCT*100:.0f}% of capital
+Rotation: every {ROTATION_INTERVAL_HOURS:.1f} hours (aggressive)
 """
     print(boot)
     send_telegram_fut(boot)
 
     threads = []
-    for sym in SYMBOLS:
+
+    # initial top gainers selection
+    ex = get_exchange()
+    try:
+        initial = get_top_gainers(ex, limit=5)
+        if not initial:
+            initial = SYMBOLS[:5]
+    except Exception as e:
+        send_telegram_fut(f"{LOG_PREFIX} error getting initial top gainers, using env: {e}")
+        initial = SYMBOLS[:5]
+
+    initial = [s for s in initial if s]  # clean
+    with SYMBOLS_LOCK:
+        ACTIVE_SYMBOLS = list(dict.fromkeys(initial))  # dedupe
+
+    send_telegram_fut(f"🔥 Initial active symbols: {', '.join(ACTIVE_SYMBOLS)}")
+
+    # start workers
+    for sym in ACTIVE_SYMBOLS:
         t = threading.Thread(target=worker, args=(sym,), daemon=True)
         t.start(); threads.append(t)
         time.sleep(1)
 
+    # start rotation manager
+    rot = threading.Thread(target=rotation_manager, daemon=True)
+    rot.start(); threads.append(rot)
+
+    # start daily summary scheduler
     if SEND_DAILY_SUMMARY:
         s = threading.Thread(target=summary_scheduler, daemon=True)
         s.start(); threads.append(s)
