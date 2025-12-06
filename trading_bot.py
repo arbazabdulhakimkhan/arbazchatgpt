@@ -1108,10 +1108,10 @@ def generate_daily_summary():
 
                     n_trades_today = len(today)
                     wins_today = int(today['Win'].sum()) if n_trades_today else 0
-                    pnl_today_sym = float(today['PnL_].sum()) if n_trades_today else 0.0
+                    pnl_today_sym = float(today['PnL_'].sum()) if n_trades_today else 0.0
 
                     if not df.empty:
-                        pnl_all = float(df['PnL_].sum())
+                        pnl_all = float(df['PnL_'].sum())
                         wins = int(df['Win'].sum()); losses = len(df)-wins
                         wr = (wins/len(df)*100) if len(df) else 0.0
                 except Exception:
@@ -1237,3 +1237,4 @@ Max Position: {MAX_POSITION_PCT*100:.0f}% | Max DD: {MAX_DRAWDOWN*100:.0f}%
 
 if __name__ == "__main__":
     main()
+
